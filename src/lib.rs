@@ -73,6 +73,7 @@ unsafe fn alloc(size: usize) -> *mut u8 {
                 (*current).size,
                 (*current).free
             );
+            split_block(current, needed);
             return (current as *mut u8).add(std::mem::size_of::<Block>());
         }
         println!(
@@ -87,6 +88,23 @@ unsafe fn alloc(size: usize) -> *mut u8 {
     println!("No suitable block found for allocation of size: {}", size);
     null_mut() // allocation attempts failed block not found
 }
+
+unsafe fn split_block(block: *mut Block, needed: usize) {
+    let total = (*block).size;
+
+    if total < needed + std::mem::size_of::<Block>() {
+        panic!("Cannot split block: not enough space");
+    }
+
+    let new_block_ptr = (block as *mut u8).add(needed) as *mut Block;
+    (*new_block_ptr).size = total - needed;
+    (*new_block_ptr).next = *FREE_LIST_HEAD.0.get();
+    (*new_block_ptr).free = true;
+
+    (*block).size = needed;
+    FREE_LIST_HEAD.0.get().write(new_block_ptr);
+}
+
 /// 現在のフリーリストの状態を標準出力に出す（debug用）
 pub unsafe fn print_free_list() {
     let mut current = *FREE_LIST_HEAD.0.get();
@@ -162,10 +180,7 @@ mod tests {
             print_free_list();
             assert_ne!(ptr1, ptr2, "Allocations should return different pointers");
             assert!(!ptr1.is_null(), "First allocation should not return null");
-            assert!(
-                ptr2.is_null(),
-                "Second allocation should return null. split not impletemented yet."
-            );
+            assert!(!ptr2.is_null(), "Second allocation should not return null.");
         }
     }
 
