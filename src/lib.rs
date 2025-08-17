@@ -116,8 +116,44 @@ unsafe fn free(ptr: *mut u8) {
 
     let block_ptr = ptr.sub(std::mem::size_of::<Block>()) as *mut Block;
     (*block_ptr).free = true;
-    (*block_ptr).next = *FREE_LIST_HEAD.0.get();
-    FREE_LIST_HEAD.0.get().write(block_ptr);
+
+    coalesing(block_ptr);
+}
+unsafe fn coalesing(mut block: *mut Block) {
+    let mut current = *FREE_LIST_HEAD.0.get();
+    let mut prev: *mut Block = null_mut();
+
+    while !current.is_null() && current < block {
+        prev = current;
+        current = (*current).next;
+    }
+
+    (*block).next = current;
+
+    if prev.is_null() {
+        FREE_LIST_HEAD.0.get().write(block);
+    } else {
+        // link previous block to the new block
+        (*prev).next = block;
+    }
+
+    // free listの先頭がblockの前にある場合、blockを前のブロックと結合する
+    if !prev.is_null() && (prev as *mut u8).add((*prev).size) == block as *mut u8 {
+        println!("Coalescing with previous block");
+        (*prev).size += (*block).size;
+        (*prev).next = (*block).next;
+        block = prev;
+    }
+
+    if !(*block).next.is_null() {
+        let next = (*block).next;
+        if (block as *mut u8).add((*block).size) == next as *mut u8 {
+            println!("Coalescing with next block");
+            // blockと次のブロックが連続している場合、結合する
+            (*block).size += (*next).size;
+            (*block).next = (*next).next;
+        }
+    }
 }
 
 /// 現在のフリーリストの状態を標準出力に出す（debug用）
