@@ -53,7 +53,6 @@ unsafe fn alloc(size: usize) -> *mut u8 {
 
     let mut prev: *mut Block = null_mut();
     let mut current = *FREE_LIST_HEAD.0.get();
-    println!("Allocating size: {}, needed: {}", size, needed);
 
     while !current.is_null() {
         if (*current).free && (*current).size >= needed {
@@ -61,27 +60,16 @@ unsafe fn alloc(size: usize) -> *mut u8 {
             (*current).free = false;
 
             if prev.is_null() {
+                // first block in the free list
                 FREE_LIST_HEAD.0.get().write((*current).next);
             } else {
                 (*prev).next = (*current).next;
-                println!("Found block: {:?}", current);
             }
 
-            println!(
-                "Allocating block: ptr: {:p}, size: {}, free: {}",
-                current,
-                (*current).size,
-                (*current).free
-            );
-            split_block(current, needed);
+            split_block(prev, current, needed);
             return (current as *mut u8).add(std::mem::size_of::<Block>());
         }
-        println!(
-            "Checking block: ptr: {:p}, size: {}, free: {}",
-            current,
-            (*current).size,
-            (*current).free
-        );
+
         prev = current;
         current = (*current).next;
     }
@@ -89,43 +77,73 @@ unsafe fn alloc(size: usize) -> *mut u8 {
     null_mut() // allocation attempts failed block not found
 }
 
-unsafe fn split_block(block: *mut Block, needed: usize) {
+unsafe fn split_block(prev: *mut Block, block: *mut Block, needed: usize) {
     let total = (*block).size;
 
-    if total < needed + std::mem::size_of::<Block>() {
-        panic!("Cannot split block: not enough space");
+    if total == needed {
+        return;
+    } else if total < needed {
+        panic!("Cannot split block: not enough space {total} {needed}");
     }
 
+    // current block is larger than needed, so we can split it
+    // new block will be created after the current block
+    // new block linked to the free list head
     let new_block_ptr = (block as *mut u8).add(needed) as *mut Block;
     (*new_block_ptr).size = total - needed;
-    (*new_block_ptr).next = *FREE_LIST_HEAD.0.get();
+    if (*block).next.is_null() {
+        (*new_block_ptr).next = null_mut();
+    } else {
+        (*new_block_ptr).next = (*block).next;
+    }
     (*new_block_ptr).free = true;
 
     (*block).size = needed;
-    FREE_LIST_HEAD.0.get().write(new_block_ptr);
+
+    if !prev.is_null() {
+        // link the previous block to the new block
+        (*prev).next = new_block_ptr;
+    } else {
+        // set free list head to the new block
+        FREE_LIST_HEAD.0.get().write(new_block_ptr);
+    }
+}
+
+unsafe fn free(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+
+    let block_ptr = ptr.sub(std::mem::size_of::<Block>()) as *mut Block;
+    (*block_ptr).free = true;
+    (*block_ptr).next = *FREE_LIST_HEAD.0.get();
+    FREE_LIST_HEAD.0.get().write(block_ptr);
 }
 
 /// 現在のフリーリストの状態を標準出力に出す（debug用）
 pub unsafe fn print_free_list() {
     let mut current = *FREE_LIST_HEAD.0.get();
     let mut i = 0;
+    let mut sum_free_size = 0;
 
     println!("---- Free List ----");
     while !current.is_null() {
         println!(
-            "#{:<2}  ptr: {:p}, size: {:>6}, free: {}, next: {:p}",
+            "#{:<2}  ptr: {:p}, size(B): {:>8}, free: {}, next: {:p}",
             i,
             current,
             (*current).size,
             (*current).free,
             (*current).next,
         );
+        sum_free_size += (*current).size;
         current = (*current).next;
         i += 1;
     }
     if i == 0 {
         println!("(empty)");
     }
+    println!("Arena Size: {sum_free_size}\nTotal free size: {ARENA_SIZE}",);
     println!("-------------------");
 }
 
@@ -177,7 +195,6 @@ mod tests {
             init_arena();
             let ptr1 = alloc(128);
             let ptr2 = alloc(256);
-            print_free_list();
             assert_ne!(ptr1, ptr2, "Allocations should return different pointers");
             assert!(!ptr1.is_null(), "First allocation should not return null");
             assert!(!ptr2.is_null(), "Second allocation should not return null.");
@@ -193,6 +210,38 @@ mod tests {
                 ptr.is_null(),
                 "Allocation exceeding arena size should return null"
             );
+        }
+    }
+
+    #[test]
+    fn test_free() {
+        unsafe {
+            init_arena();
+        }
+        for i in 0..10 {
+            println!("Test free: iteration {}", i);
+            unsafe {
+                let p1 = alloc(128);
+                let p2 = alloc(256);
+
+                println!("Allocated !! pointers: p1: {:?}, p2: {:?}", p1, p2);
+                let before_free = *FREE_LIST_HEAD.0.get();
+                assert!(
+                    !before_free.is_null(),
+                    "Free list should not be empty before freeing"
+                );
+
+                free(p1);
+                let head = *FREE_LIST_HEAD.0.get();
+
+                assert_eq!(
+                    head,
+                    (p1 as *mut u8).sub(std::mem::size_of::<Block>()) as *mut Block,
+                    "Free list head should point to freed block"
+                );
+                free(p2);
+                print_free_list();
+            }
         }
     }
 }
