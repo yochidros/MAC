@@ -1,9 +1,13 @@
-use std::{cell::UnsafeCell, ptr::null_mut};
+use std::{
+    cell::UnsafeCell,
+    ptr::null_mut,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const ARENA_SIZE: usize = 1024 * 1024; // 1 MiB
 
 #[repr(C, align(16))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Block {
     size: usize,
     next: *mut Block,
@@ -43,6 +47,25 @@ unsafe fn init_arena() {
 fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
+struct Alloced(UnsafeCell<Vec<*mut Block>>);
+impl Alloced {
+    fn add(&self, ptr: *mut Block) {
+        let v = self.0.get();
+        unsafe {
+            (*v).push(ptr);
+        }
+    }
+    fn remove(&self, ptr: *mut Block) {
+        let v = self.0.get();
+        unsafe {
+            if let Some(pos) = (*v).iter().position(|&x| x == ptr) {
+                (*v).remove(pos);
+            }
+        }
+    }
+}
+static ALLOCATED: Alloced = Alloced(UnsafeCell::new(vec![]));
+unsafe impl Sync for Alloced {}
 
 unsafe fn alloc(size: usize) -> *mut u8 {
     if size == 0 {
@@ -53,52 +76,30 @@ unsafe fn alloc(size: usize) -> *mut u8 {
 
     let mut prev = *FREE_LIST_HEAD.0.get();
     let mut current = (*prev).next;
-    let start = current;
 
     loop {
         if (*current).free && (*current).size >= needed {
-            // found block!!
-            (*current).free = false;
-            if (*current).size == needed {
+            let remainder = (*current).size - needed;
+            let min_split = std::mem::size_of::<Block>() + align;
+            if remainder >= min_split {
+                (*current).free = false;
+                split_block(prev, current, needed);
+            } else {
+                (*current).free = false;
                 (*prev).next = (*current).next;
-
-                if current == *FREE_LIST_HEAD.0.get() {
-                    // if we are freeing the head, update the head
+                if current == FREE_LIST_HEAD.0.get().read() {
                     FREE_LIST_HEAD.0.get().write(prev);
                 }
-            } else {
-                let new_block = (current as *mut u8).add(needed) as *mut Block;
-                (*new_block).size = (*current).size - needed;
-                (*new_block).free = true;
-                println!(
-                    "Splitting block: {:?}({:?}) into new block: {:?}({:?})",
-                    current,
-                    (*current).size,
-                    new_block,
-                    (*new_block).size
-                );
-
-                (*new_block).next = new_block;
-                (*prev).next = new_block;
-
-                (*current).size = needed;
-                (*current).next = null_mut();
-
-                if current == *FREE_LIST_HEAD.0.get() {
-                    // if we are freeing the head, update the head
-                    FREE_LIST_HEAD.0.get().write(new_block);
-                }
             }
-
+            ALLOCATED.add(current);
             println!(
-                "Allocated block: {:?} with size: {}",
+                "Allocated!! block: {:?} with size: {}",
                 current,
                 (*current).size
             );
             return (current as *mut u8).add(std::mem::size_of::<Block>());
         }
         if current == FREE_LIST_HEAD.0.get().read() {
-            println!("Reached the end of the free list without finding a suitable block.");
             break;
         }
         prev = current;
@@ -108,93 +109,105 @@ unsafe fn alloc(size: usize) -> *mut u8 {
     null_mut() // allocation attempts failed block not found
 }
 
-unsafe fn split_block(prev: *mut Block, block: *mut Block, needed: usize) {
-    let total = (*block).size;
-
-    if total == needed {
-        return;
-    } else if total < needed {
-        panic!("Cannot split block: not enough space {total} {needed}");
+unsafe fn split_block(prev: *mut Block, current: *mut Block, needed: usize) {
+    let new_block = (current as *mut u8).add(needed) as *mut Block;
+    (*new_block).size = (*current).size - needed;
+    (*new_block).free = true;
+    (*new_block).next = (*current).next;
+    if prev == current {
+        (*new_block).next = new_block; // if we are splitting the head, point to itself
+    } else {
+        (*prev).next = new_block;
     }
 
-    // current block is larger than needed, so we can split it
-    // new block will be created after the current block
-    // new block linked to the free list head
-    let new_block_ptr = (block as *mut u8).add(needed) as *mut Block;
-    (*new_block_ptr).size = total - needed;
-    (*new_block_ptr).next = (*block).next;
-    (*new_block_ptr).free = true;
+    (*current).size = needed;
 
-    (*block).size = needed;
-
-    // set free list head to the new block
-    FREE_LIST_HEAD.0.get().write(new_block_ptr);
+    if current == *FREE_LIST_HEAD.0.get() {
+        // if we are freeing the head, update the head
+        FREE_LIST_HEAD.0.get().write(new_block);
+    }
 }
 
 unsafe fn free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
+    let mut block = ptr.sub(std::mem::size_of::<Block>()) as *mut Block;
+    (*block).free = true;
+    ALLOCATED.remove(block);
 
-    let block_ptr = ptr.sub(std::mem::size_of::<Block>()) as *mut Block;
-    (*block_ptr).free = true;
+    let headp = FREE_LIST_HEAD.0.get();
+    let head = *headp;
+    if head.is_null() {
+        (*block).next = block;
+        headp.write(block);
+        return;
+    }
 
-    println!("Freeing block: {:?}", block_ptr);
-    coalesing(block_ptr);
-    println!("Freed!! {:?}", block_ptr);
-}
-unsafe fn coalesing(mut block: *mut Block) {
-    let mut current = *FREE_LIST_HEAD.0.get();
+    let mut current = head;
+    let mut next = (*current).next;
 
-    let start = current;
     loop {
-        if block > current && block < (*current).next {
-            println!("Found position to insert block: {:?}", current);
+        // current < block < next
+        if current < block && block < next {
             break;
         }
-        if current >= (*current).next && (block > current || block < (*current).next) {
-            // we are at the end of the list, and block is not in the list
-            println!("Reached end of free list, inserting block: {:?}", current);
+        if current >= next && (block > current || block < next) {
             break;
         }
-        current = (*current).next;
-        if current == start {
-            println!(
-                "Reached the start of the free list, inserting block: {:?}",
-                current
-            );
+        current = next;
+        next = (*current).next;
+        if current == *headp {
             break;
         }
     }
-
     // insert
-    (*block).next = (*current).next;
+    (*block).next = next;
     (*current).next = block;
 
-    // free listの先頭がblockの前にある場合、blockを前のブロックと結合する
-    if (block as *mut u8).add((*block).size) == (*block).next as *mut u8 {
-        println!("Coalescing with next block");
-        (*block).size += (*(*block).next).size;
-        (*block).next = (*(*block).next).next;
-    }
+    // coalescing
+    {
+        let mut next_after = (*block).next;
+        // println!(
+        //     "block: {:?}, added: {:?} next_after: {:?}",
+        //     block,
+        //     (block as *mut u8).add((*block).size),
+        //     next_after
+        // );
 
-    if (current as *mut u8).add((*current).size) == block as *mut u8 {
-        println!("Coalescing with next block");
-        // blockと次のブロックが連続している場合、結合する
-        (*current).size += (*block).size;
-        (*current).next = (*block).next;
-        block = current; // blockを更新
+        if (block as *mut u8).add((*block).size) == next_after as *mut u8 {
+            // !! Merging with next block
+            (*block).size += (*next).size;
+            (*block).next = (*next).next;
+            if next_after == *headp {
+                headp.write(block);
+            }
+            next_after = (*block).next;
+        }
+
+        if (current as *mut u8).add((*current).size) == block as *mut u8 {
+            // !! Merging with previous block
+            (*current).size += (*block).size;
+            (*current).next = (*block).next;
+            if *headp == block {
+                headp.write(current);
+            }
+            block = current; // blockを更新
+        }
     }
+    println!("Freed!! {:?}", ptr);
 }
+
+unsafe fn coalesing(mut block: *mut Block) {}
 
 /// 現在のフリーリストの状態を標準出力に出す（debug用）
 pub unsafe fn print_free_list() {
     let mut current = *FREE_LIST_HEAD.0.get();
     let mut i = 0;
     let mut sum_free_size = 0;
-    let start = current;
 
-    println!("---- Free List ---- start: {start:p}");
+    println!();
+    println!("---- Free List ----");
     loop {
         println!(
             "#{:<2}  ptr: {:p}, size(B): {:>8}, free: {}, next: {:p}",
@@ -207,7 +220,7 @@ pub unsafe fn print_free_list() {
         sum_free_size += (*current).size;
         current = (*current).next;
         i += 1;
-        if current == FREE_LIST_HEAD.0.get().read() {
+        if current == FREE_LIST_HEAD.0.get().read() || i > 10 {
             break; // 循環している場合は終了
         }
     }
@@ -218,6 +231,11 @@ pub unsafe fn print_free_list() {
         "Arena Size: {ARENA_SIZE}\nTotal free size: {sum_free_size}\nUsed Size: {}",
         ARENA_SIZE - sum_free_size
     );
+    println!("-------------------");
+    println!("Allocated blocks:");
+    (*ALLOCATED.0.get()).iter().enumerate().for_each(|(i, p)| {
+        println!("#{i}: {p:?}");
+    });
     println!("-------------------");
 }
 
@@ -297,8 +315,9 @@ mod tests {
             unsafe {
                 let p1 = alloc(128);
                 let p2 = alloc(256);
+                let p3 = alloc(512);
+                let p4 = alloc(1024);
 
-                println!("Allocated !! pointers: p1: {:?}, p2: {:?}", p1, p2);
                 let before_free = *FREE_LIST_HEAD.0.get();
                 assert!(
                     !before_free.is_null(),
@@ -306,9 +325,17 @@ mod tests {
                 );
 
                 free(p1);
+                free(p2);
+                free(p4);
                 assert!(
                     find_block_in_free_list(p1),
-                    "freed block should be in free list"
+                    "freed block should be in free list {:?}",
+                    p1
+                );
+                assert!(
+                    find_block_in_free_list(p4),
+                    "freed block should be in free list {:?}",
+                    p4
                 );
                 print_free_list();
             }
